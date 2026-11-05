@@ -1,115 +1,254 @@
-# analyze elf for project 2
-# csc6580 reverse engineering
-# perlman group
-# dennis jump
-# oct 30, 2026
-import os
+# analyze_elf.py -- project 2, csc6580 reverse engineering
+# perlman group: Dennis Jump, Aaron Werth, Joseph Cherry, Maraz Mia
 import sys
-from elftools.elf.elffile import ELFFile, ELFError
-from elftools.elf.sections import SymbolTableSection
-from elftools.elf.sections import Symbol
-from capstone import *
+from collections import deque
 
-from start_address import *
-from code_block_extraction import *
-from elf_utilities import *
+from capstone import (Cs, CS_ARCH_X86, CS_MODE_64,
+                      CS_GRP_CALL, CS_GRP_JUMP, CS_GRP_RET)
+from capstone.x86_const import (X86_OP_IMM, X86_OP_MEM, X86_OP_REG,
+                                X86_REG_RIP, X86_REG_RDI, X86_REG_EDI)
+from elftools.elf.elffile import ELFFile
 
-# ------- main control ----------------
-# analyze elf keeps the elf file open throughout the preliminary analysis
-# checks for the validity of the .text section
-# passes it to the capstone for disassembly
-# captures the results in a list of tuples for further testing
-# in a later phase of the project
+# Instructions after which execution does not continue.
+STOP_INSTRUCTIONS = {'hlt', 'ud2', 'int3'}
+
+
+def base_mnemonic(instruction):
+    """Mnemonic without prefixes (capstone reports e.g. 'notrack jmp')."""
+    return instruction.mnemonic.split()[-1]
+
+
+def load_regions(elf):
+    """Read file-backed executable sections, including sections other than .text."""
+    regions = []
+    for section in elf.iter_sections():
+        if (section['sh_flags'] & 4 and section['sh_type'] != 'SHT_NOBITS'
+                and int(section['sh_size']) > 0):
+            regions.append((int(section['sh_addr']), section.data(), section.name))
+    return regions
+
+
+def region_at(regions, address):
+    """Return the executable section containing a virtual address, if any."""
+    for base, data, name in regions:
+        if base <= address < base + len(data):
+            return base, data, name
+    return None
+
+
+def decode_one(decoder, regions, address):
+    """Decode one instruction without reading past the end of its ELF section."""
+    region = region_at(regions, address)
+    if region is None:
+        return None
+    base, data, _ = region
+    offset = address - base
+    return next(decoder.disasm(data[offset:offset + 15], address, count=1), None)
+
+
+def immediate_target(instruction):
+    """Find a direct call or branch target; indirect targets remain unknown."""
+    if instruction.operands and instruction.operands[0].type == X86_OP_IMM:
+        return int(instruction.operands[0].imm)
+    return None
+
+
+def rip_memory_address(instruction):
+    """Resolve the address of a RIP-relative memory operand, not its contents."""
+    if not instruction.operands:
+        return None
+    operand = instruction.operands[0]
+    if (operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP
+            and operand.mem.index == 0):
+        return instruction.address + instruction.size + operand.mem.disp
+    return None
+
+
+def libc_relocations(elf):
+    """Collect GOT slots whose dynamic relocations refer to __libc_start_main."""
+    slots = set()
+    for section in elf.iter_sections():
+        if section['sh_type'] not in ('SHT_REL', 'SHT_RELA'):
+            continue
+        symbols = elf.get_section(section['sh_link'])
+        # Static binaries can have relocation sections with no symbol table.
+        if symbols is None or not hasattr(symbols, 'get_symbol'):
+            continue
+        for relocation in section.iter_relocations():
+            symbol = symbols.get_symbol(relocation['r_info_sym'])
+            if symbol is not None and symbol.name.split('@')[0] == '__libc_start_main':
+                slots.add(int(relocation['r_offset']))
+    return slots
+
+
+def call_reaches_libc(instruction, decoder, regions, slots):
+    """Recognize a GOT-indirect call or a direct call into a libc PLT stub."""
+    if rip_memory_address(instruction) in slots:
+        return True
+    target = immediate_target(instruction)
+    if target is None:
+        return False
+    # A PLT entry may begin with endbr64, then a RIP-relative indirect jump.
+    for _ in range(4):
+        stub = decode_one(decoder, regions, target)
+        if stub is None:
+            return False
+        if base_mnemonic(stub) == 'jmp':
+            return rip_memory_address(stub) in slots
+        if stub.mnemonic not in ('endbr64', 'nop'):
+            return False
+        target += stub.size
+    return False
+
+
+def candidate_main(instruction):
+    """Recognize common instructions that load main's address into RDI."""
+    operands = instruction.operands
+    if len(operands) < 2 or operands[0].type != X86_OP_REG:
+        return None
+    if operands[0].reg not in (X86_REG_RDI, X86_REG_EDI):
+        return None
+    source = operands[1]
+    if instruction.mnemonic == 'lea' and source.type == X86_OP_MEM:
+        if source.mem.base == X86_REG_RIP and source.mem.index == 0:
+            return instruction.address + instruction.size + source.mem.disp
+    if instruction.mnemonic == 'mov' and source.type == X86_OP_IMM:
+        mask = 0xffffffff if operands[0].reg == X86_REG_EDI else 0xffffffffffffffff
+        return int(source.imm) & mask
+    return None
+
+
+def writes_first_argument(instruction):
+    """Conservatively detect explicit writes to the RDI/EDI argument register."""
+    operands = instruction.operands
+    return (bool(operands) and operands[0].type == X86_OP_REG
+            and operands[0].reg in (X86_REG_RDI, X86_REG_EDI)
+            and instruction.mnemonic not in ('cmp', 'test', 'push'))
+
+
+def find_start(elf, decoder, regions):
+    """Use main instead of the ELF entry when the entry is a standard libc start.
+
+    A standard start loads main's address into RDI and then calls
+    __libc_start_main. The call is recognised through the dynamic relocation
+    for __libc_start_main, or (static binaries) as a call followed by hlt.
+    """
+    entry = int(elf.header['e_entry'])
+    slots = libc_relocations(elf)
+    address = entry
+    main_address = None
+    for _ in range(80):
+        instruction = decode_one(decoder, regions, address)
+        if instruction is None:
+            break
+        if writes_first_argument(instruction):
+            main_address = candidate_main(instruction)
+        if instruction.group(CS_GRP_CALL):
+            if main_address is not None and region_at(regions, main_address):
+                following = decode_one(decoder, regions, address + instruction.size)
+                ends_in_hlt = following is not None and following.mnemonic == 'hlt'
+                if call_reaches_libc(instruction, decoder, regions, slots) or ends_in_hlt:
+                    return main_address
+            # An unrelated call may modify RDI, so the earlier value is unreliable.
+            main_address = None
+        if (instruction.group(CS_GRP_JUMP) or instruction.group(CS_GRP_RET)
+                or instruction.mnemonic in STOP_INSTRUCTIONS):
+            break
+        address += instruction.size
+    return entry
+
+
+def successors(instruction):
+    """Return statically known successors, excluding indirect branch destinations."""
+    following = instruction.address + instruction.size
+    if instruction.group(CS_GRP_JUMP):
+        target = immediate_target(instruction)
+        edges = [target] if target is not None else []
+        if base_mnemonic(instruction) != 'jmp':
+            edges.append(following)
+        return edges
+    if instruction.group(CS_GRP_RET) or instruction.mnemonic in STOP_INSTRUCTIONS:
+        return []
+    return [following]
+
+
+def is_terminator(instruction):
+    """A block ends at a jump, return or stop. Calls do NOT end a block."""
+    return bool(instruction.group(CS_GRP_JUMP) or instruction.group(CS_GRP_RET)
+                or instruction.mnemonic in STOP_INSTRUCTIONS)
+
+
+def discover_blocks(decoder, regions, start):
+    """Explore reachable code, then split decoded runs at all discovered leaders."""
+    leaders = {start}
+    pending = deque([start])
+    decoded = {}
+    while pending:
+        address = pending.popleft()
+        if region_at(regions, address) is None:
+            continue
+        while address not in decoded:
+            instruction = decode_one(decoder, regions, address)
+            if instruction is None:
+                break
+            decoded[address] = instruction
+            if instruction.group(CS_GRP_CALL):
+                # The callee starts a block; the code after the call stays in this one.
+                target = immediate_target(instruction)
+                if target is not None and region_at(regions, target) is not None:
+                    if target not in leaders:
+                        leaders.add(target)
+                    pending.append(target)
+            if is_terminator(instruction):
+                for target in successors(instruction):
+                    if region_at(regions, target) is not None:
+                        leaders.add(target)
+                        pending.append(target)
+                break
+            address += instruction.size
+            if region_at(regions, address) is None:
+                break
+
+    # Every leader divides a block, even when it was found after linear decoding.
+    result = []
+    for leader in sorted(leaders):
+        if leader not in decoded:
+            continue
+        block = []
+        address = leader
+        while address in decoded:
+            if address != leader and address in leaders:
+                break
+            instruction = decoded[address]
+            block.append(instruction)
+            if is_terminator(instruction):
+                break
+            address += instruction.size
+        if block:
+            result.append(block)
+    return result
+
 
 def analyze_elf(path: str):
     with open(path, "rb") as file:
         elf = ELFFile(file)
-        # dj check the E header for the entry point
-        section_name = ""
-        start = 0
-        section_address = 0
-        build_plt_map(elf)
-        [section_name,section_address,start] = get_start_section_and_address(elf)
-        # dj get a reference to the .text section
-        print(f"get contents of {section_name} section")
-        the_section = find_section(elf,section_name)
-        # dj don't fall for Stacy passing in an elf file without a .text section
-        if not the_section: return -1
-#        return
-        # dj the disassembler has to have the machine for the object code
-        # dj and whether it is written for 16-32-64 bit architecture
-        # dj i pulled out the machine type - we would need to change that
-        # dj into capstone parameter values
-        # dj see the disassemble method -- i hard-coded the values to test easily
-#       arch = elf.header['e_machine']
-#       mode = CS_MODE_64
-        # dj get the binary data ... or maybe a reference to it
-        # dj haven't worried about it for the moment
-        # dj it works
-        the_contents = the_section.data()
-        # dj get the size of the .text section
-        the_size:int = the_section.data_size
-        print(f"contents of {section_name} is {the_size} bytes long")
-#        the_size = 4096
-        # dj get entry point
-        # dj send these to the disassembler
-        instruction_list:list[int,str,str] = disassemble(the_contents,section_address)
-        updated_instruction_list = code_block_extraction(elf,instruction_list,start)
-        #
-        # BEWARE: the instruction list is now list[str,str,str] so I can put address labels in the address field
-        # I can expand the fields to list[int,str,str,str] if that is a hardship
-        # either way, there will be a change
-        #
-        # dj testing that the disassembler did its job
-        # dj and the code block extraction divided things up
-        # dj dump the code to see what it looks like
-        dump_updated_instruction_list(updated_instruction_list)        
-        None
-    None
-# find_text_section checks the elf file for a .text section
-# returns an ANY result - NULL would be a missing or corrupt .text section
-# disassemble calls capstone disassembly for the .text file
-def disassemble(text,base:int) -> list:
-    # dj could pass arch and mode as parameters and generate
-    # dj capstone equivalents for making this more flexible
-    # dj this could come from the exec hdr at a later date as needed
 
-#    md = Cs(arch,mode)
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
-    md.syntax = CS_OPT_SYNTAX_INTEL
-    instructionList:list = []
-    print(f"disasm entry offset: {base:x}")
-    for i in md.disasm(text, base):
-        # dj for later things to come, I suspect
-        # dj we may want to generate a List of instructions with
-        # dj tuples for address mnemonic and op_str
-        # dj and return the list instead of printing it
-        # print(f"0x{i.address:x}:\t{i.mnemonic}\t{i.op_str}")
-        # dj oh, what the hell. I start writing and can't stop
+        if elf.elfclass != 64 or elf['e_machine'] != 'EM_X86_64':
+            raise ValueError('Expected a 64-bit AMD64 ELF file')
+        if elf['e_type'] not in ('ET_EXEC', 'ET_DYN'):
+            raise ValueError('Expected an ELF executable (ET_EXEC or ET_DYN)')
 
-        # found that disasm puts out an offset address which is the size of the from (probably .init)
-        # and not the address that matches the entry address nor the main address
-        # ... as an experiment, pass the size of the .init section and the base address of
-        # .text or whatever section it is to get a good address
-        address = i.address
-        operands = i.op_str
-# #        if i.mnemonic in jmp_cmd:
-#         print(f"{i.mnemonic} {i.op_str}")
-#         if "[rip" in i.op_str:
-#             print(f"relative {i.mnemonic} {i.op_str}")                   
-#             None
-#         elif "0x" in i.op_str:
-#             print(f"just hex {i.mnemonic} {i.op_str}")                   
-#             target = int(i.op_str,16)
-#             None
-#         else:
-#             print(f"unknown {i.mnemonic} {i.op_str}")                   
-#             None
-# #           operands = f"0x{target:x}"
-# #           print(f"{i.mnemonic} {operands} target= {target:x}")
-# #            None
-
-        instructionList.append(( i.address,i.mnemonic,i.op_str))
-        None
-    return instructionList
-
+        regions = load_regions(elf)
+        entry = int(elf.header['e_entry'])
+        if region_at(regions, entry) is None:
+            raise ValueError(f'Entry point 0x{entry:x} is not in an executable section')
+        decoder = Cs(CS_ARCH_X86, CS_MODE_64)
+        decoder.detail = True
+        start = find_start(elf, decoder, regions)
+        blocks = discover_blocks(decoder, regions, start)
+        for index, block in enumerate(blocks):
+            if index:
+                print()
+            for instruction in block:
+                suffix = f' {instruction.op_str}' if instruction.op_str else ''
+                print(f'0x{instruction.address:x}: {instruction.mnemonic}{suffix}')
